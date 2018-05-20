@@ -10,10 +10,12 @@ import com.wurmonline.server.players.Player;
 import com.wurmonline.server.spells.CamouflageSpell;
 import com.wurmonline.server.zones.VirtualZone;
 import com.wurmonline.shared.constants.BodyPartConstants;
-import javassist.*;
+import javassist.CtClass;
+import javassist.CtMethod;
+import javassist.CtPrimitiveType;
+import javassist.NotFoundException;
 import javassist.bytecode.*;
-import javassist.expr.ExprEditor;
-import javassist.expr.MethodCall;
+import org.gotti.wurmunlimited.modloader.classhooks.CodeReplacer;
 import org.gotti.wurmunlimited.modloader.classhooks.HookManager;
 import org.gotti.wurmunlimited.modloader.interfaces.*;
 import org.gotti.wurmunlimited.modsupport.actions.ModActions;
@@ -70,40 +72,46 @@ public class CamouflageMod implements WurmServerMod, Initable, ServerStartedList
             // Construct a byte array to find in addCreature's bytecode and get the table line number where that found
             // byte array is at.
             ctClassVirtualZone.getClassFile().compact();
-            Bytecode bytecode = new Bytecode(ctClassVirtualZone.getClassFile().getConstPool());
-            bytecode.addAload(0);
-            bytecode.addGetfield("com.wurmonline.server.zones.VirtualZone", "creatures", "Ljava/util/Map;");
-            bytecode.addLload(1);
-            bytecode.addInvokestatic("java.lang.Long", "valueOf", "(J)Ljava/lang/Long;");
-            bytecode.addConstZero(HookManager.getInstance().getClassPool().get(
+            Bytecode find = new Bytecode(ctClassVirtualZone.getClassFile().getConstPool());
+            find.addAload(0);
+            find.addGetfield("com.wurmonline.server.zones.VirtualZone", "creatures", "Ljava/util/Map;");
+            find.addLload(1);
+            find.addInvokestatic("java.lang.Long", "valueOf", "(J)Ljava/lang/Long;");
+            find.addConstZero(HookManager.getInstance().getClassPool().get(
                     "com.wurmonline.server.creatures.CreatureMove"));
-            bytecode.addInvokeinterface("java.util.Map", "put",
+            find.addInvokeinterface("java.util.Map", "put",
                     "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", 3);
-            bytecode.addOpcode(Opcode.POP);
-            byte[] find = bytecode.get();
-            int tableLineNumber = byteArrayToLineNumber(find, ctMethodAddCreature, 15);
+            find.addOpcode(Opcode.POP);
 
-            ctMethodAddCreature.instrument(new ExprEditor() {
-                @Override
-                public void edit(MethodCall methodCall) throws CannotCompileException {
-                    if (Objects.equals("put", methodCall.getMethodName())
-                            && methodCall.getLineNumber() == tableLineNumber){
-                        methodCall.replace("{" +
-                                "$_ = com.joedobo27.c.CamouflageMod#canCreatureCamouflagedInVisionZone(" +
-                                "this, creatureId) ? null : $proceed($$);" +
-                                "}");
-                        putHookInstalled = true;
-                    }
-                }
-            });
-            if (!putHookInstalled)
-                logger.warning("FAILURE  installing hook on put() in VirtualZone.addCreature().");
+            int lineNumber = byteArrayToLineNumber(find.get(), ctMethodAddCreature, 15);
 
-        }catch (NotFoundException | CannotCompileException | BadBytecode | RuntimeException e){
-            logger.warning(e.getMessage());
+            Bytecode replace = new Bytecode(ctClassVirtualZone.getClassFile().getConstPool());
+            replace.addAload(0);
+            replace.addLload(1);
+            replace.addInvokestatic("com.joedobo27.c.CamouflageMod", "canCreatureCamouflagedInVisionZone",
+                    "(Lcom/wurmonline/server/zones/VirtualZone;J)Z");
+            codeBranching(replace, Opcode.IFNE, 18);
+            replace.addAload(0);
+            replace.addGetfield("com.wurmonline.server.zones.VirtualZone", "creatures", "Ljava/util/Map;");
+            replace.addLload(1);
+            replace.addInvokestatic("java.lang.Long", "valueOf", "(J)Ljava/lang/Long;");
+            replace.addConstZero(HookManager.getInstance().getClassPool().get(
+                    "com.wurmonline.server.creatures.CreatureMove"));
+            replace.addInvokeinterface("java.util.Map", "put",
+                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", 3);
+            replace.addOpcode(Opcode.POP);
+
+
+            CodeReplacer codeReplacer = new CodeReplacer(ctMethodAddCreature.getMethodInfo().getCodeAttribute());
+            codeReplacer.replaceCode(find.get(), replace.get());
+            ctMethodAddCreature.getMethodInfo().rebuildStackMapIf6(ctClassVirtualZone.getClassPool(), ctClassVirtualZone.getClassFile());
+            ctClassVirtualZone.debugWriteFile("C:\\Users\\Jason\\Documents\\WU\\WU-Server\\byte code prints\\");
+
+        }catch (NotFoundException | BadBytecode | RuntimeException e){
+            logger.warning(e.getMessage() + " FAILURE  installing hook on put() in VirtualZone.addCreature().");
         }
+        putHookInstalled = true;
     }
-
 
     @Override
     public void onServerStarted() {
@@ -213,5 +221,9 @@ public class CamouflageMod implements WurmServerMod, Initable, ServerStartedList
             return ByteBuffer.wrap(bytesOriginal).getLong();
     }
 
+    private static void codeBranching(Bytecode bytecode, int opcode, int branchCount){
+        bytecode.addOpcode(opcode);
+        bytecode.add((branchCount >>> 8) & 0xFF, branchCount & 0xFF);
+    }
 
 }

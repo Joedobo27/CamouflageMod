@@ -24,8 +24,8 @@ public class CamouflageSpell extends ReligiousSpell {
                 ConfigureOptions.getInstance().getCoolDownEarthMilliseconds());
         this.targetItem = true;
         this.enchantment = Enchants.CRET_ILLUSION;
-        this.effectdesc = "and this will help hide you from monsters.";
-        this.description = "and this will help hide you from monsters";
+        this.effectdesc = "will help hide you from monsters.";
+        this.description = "will help hide you from monsters";
     }
 
     private static class SingletonHelper {
