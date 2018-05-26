@@ -2,37 +2,34 @@ package com.joedobo27.c;
 
 import com.wurmonline.server.Server;
 import com.wurmonline.server.combat.ArmourTypes;
-import com.wurmonline.server.creatures.Communicator;
-import com.wurmonline.server.creatures.Creature;
-import com.wurmonline.server.creatures.NoArmourException;
+import com.wurmonline.server.creatures.*;
 import com.wurmonline.server.items.NoSpaceException;
 import com.wurmonline.server.players.Player;
 import com.wurmonline.server.spells.CamouflageSpell;
 import com.wurmonline.server.zones.VirtualZone;
 import com.wurmonline.shared.constants.BodyPartConstants;
-import javassist.CtClass;
-import javassist.CtMethod;
-import javassist.CtPrimitiveType;
-import javassist.NotFoundException;
+import javassist.*;
 import javassist.bytecode.*;
+import org.gotti.wurmunlimited.modloader.ReflectionUtil;
 import org.gotti.wurmunlimited.modloader.classhooks.CodeReplacer;
 import org.gotti.wurmunlimited.modloader.classhooks.HookManager;
 import org.gotti.wurmunlimited.modloader.interfaces.*;
 import org.gotti.wurmunlimited.modsupport.actions.ModActions;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Objects;
-import java.util.Properties;
+import java.util.*;
+import java.util.Map.Entry;
+import java.util.function.Function;
 import java.util.logging.Logger;
+import java.util.stream.Collector;
+import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
 public class CamouflageMod implements WurmServerMod, Initable, ServerStartedListener, Configurable, PlayerMessageListener {
 
     static final Logger logger = Logger.getLogger(CamouflageMod.class.getName());
 
-    private boolean putHookInstalled = false;
+    private static boolean putHookInstalled = false;
 
     @Override
     public void configure(Properties properties) {
@@ -61,6 +58,123 @@ public class CamouflageMod implements WurmServerMod, Initable, ServerStartedList
     @Override
     public void init() {
         try {
+            HookManager.getInstance().getClassPool().get("com.wurmonline.server.zones.VirtualZone")
+                    .getDeclaredMethod("checkIfAttack").insertBefore("" +
+                    "if (com.joedobo27.c.CamouflageMod#shouldCamouflageCancelAttack($0, $2))" +
+                    "   return;");
+
+            HookManager.getInstance().getClassPool().get("com.wurmonline.server.creatures.Creature")
+                    .getMethod("attackTarget", Descriptor.ofMethod(CtPrimitiveType.voidType, null))
+                    .insertBefore("" +
+                            "if (com.joedobo27.c.CamouflageMod#shouldCamouflageCancelAttack($0))" +
+                            "   return;");
+
+            // Creature.attackTarget()
+        }catch (NotFoundException | CannotCompileException e){
+            logger.warning(e.getMessage() + " FAILURE  modifying VirtualZone class methods.");
+        }
+        putHookInstalled = true;
+    }
+
+    @Override
+    public void onServerStarted() {
+        if (putHookInstalled) {
+            CamouflageSpellActionPerformer camouflageSpellActionPerformer =
+                    CamouflageSpellActionPerformer.getCamouflageSpellActionPerformer();
+            ModActions.registerAction(camouflageSpellActionPerformer);
+            ModActions.registerAction(camouflageSpellActionPerformer.getActionEntry());
+
+            CamouflageSpell.build();
+        }
+    }
+
+    @SuppressWarnings({"unused", "WeakerAccess"})
+    public static boolean shouldCamouflageCancelAttack(Creature creature) {
+        VisionArea visionArea = creature.getVisionArea();
+        VirtualZone virtualZone;
+        if (creature.isOnSurface())
+            virtualZone = visionArea.getSurface();
+        else
+            virtualZone = visionArea.getUnderGround();
+        return shouldCamouflageCancelAttack(virtualZone, creature.getWurmId());
+    }
+
+    @SuppressWarnings({"unused", "WeakerAccess"})
+    public static boolean shouldCamouflageCancelAttack(VirtualZone visionZone, long creatureId) {
+        Creature mob = visionZone.getWatcher();
+        Creature player = Server.getInstance().getCreatureOrNull(creatureId);
+        if (!(player instanceof Player) || mob == null || !canCreatureCamouflagedInVisionZone(visionZone, creatureId))
+            return false;
+        HashMap<Long, CreatureMove> creatures;
+        try {
+            creatures = ReflectionUtil.getPrivateField(visionZone, ReflectionUtil.getField(
+                    Class.forName("com.wurmonline.server.zones.VirtualZone"), "creatures"));
+        }catch (ClassNotFoundException | NoSuchFieldException | IllegalAccessException e) {
+            return false;
+        }
+        boolean isTargeting = mob.getTarget() != null && mob.getTarget().getWurmId() == creatureId;
+
+        synchronized (visionZone) {
+            creatures.remove(creatureId);
+            if (isTargeting)
+                mob.removeTarget(creatureId);
+        }
+        return true;
+    }
+
+    @SuppressWarnings({"unused", "BooleanMethodIsAlwaysInverted"})
+    private static boolean canCreatureCamouflagedInVisionZone(VirtualZone visionZone, long creatureId){
+        Creature creature = Server.getInstance().getCreatureOrNull(creatureId);
+        Creature watcher = visionZone.getWatcher();
+        if (watcher == null || watcher instanceof Player || watcher.isGuard() || creature == null
+                || creature.getTarget() != null || !(creature instanceof Player))
+            return false;
+
+        ArrayList<Byte> armorPositions = new ArrayList<>(Arrays.asList(
+                BodyPartConstants.HEAD, BodyPartConstants.LEFT_ARM, BodyPartConstants.LEFT_HAND,
+                BodyPartConstants.RIGHT_ARM, BodyPartConstants.RIGHT_HAND, BodyPartConstants.TORSO,
+                BodyPartConstants.LEGS, BodyPartConstants.LEFT_FOOT, BodyPartConstants.RIGHT_FOOT));
+        double camouflagePowerTally = armorPositions.stream()
+                .mapToDouble(armorPos -> {
+                    try{
+                        return creature.getArmour(armorPos).getBonusForSpellEffect((byte)72);
+                    }catch (NoArmourException | NoSpaceException e) {
+                        return 0.0D;
+                    }
+                })
+                .average()
+                .orElse(0.0D);
+        if (camouflagePowerTally == 0.0D)
+            return false;
+        int rollSpellPower = Server.rand.nextInt(100) + 1;
+        double spellPowerScaled = ConfigureOptions.getInstance().getSpellPowerExplainsCamouflageChance()
+                .doFunctionOfX(camouflagePowerTally);
+        boolean spellPowerCamouflageFailure = rollSpellPower > Math.min(100, Math.max(1, spellPowerScaled));
+
+        double recoveryScaled = ConfigureOptions.getInstance().getCamouflageRecoveryScale().doFunctionOfX(camouflagePowerTally);
+        boolean isCamouflageOnCoolDown = creature.hasBeenAttackedWithin((int)Math.ceil(recoveryScaled));
+
+        double armorLevel = armorPositions.stream()
+                .mapToDouble(armorPos -> {
+                    try{
+                        return ArmourTypes.getArmourBaseDR(creature.getArmour(armorPos).getArmourType());
+                    }catch (NoArmourException | NoSpaceException e) {
+                        return 0.0D;
+                    }
+                })
+                .average()
+                .orElse(0.0D);
+        int rollArmor = Server.rand.nextInt(100);
+        double armorScaled = ConfigureOptions.getInstance().getArmorDRExplainsCamouflageChance().doFunctionOfX(armorLevel);
+        boolean armorDRCamouflageFailure = rollArmor >= 100 - Math.min(100, Math.max(0, armorScaled));
+
+
+        return (!isCamouflageOnCoolDown && !spellPowerCamouflageFailure && !armorDRCamouflageFailure);
+    }
+
+    @Deprecated
+    private static void oldCodeAttempts() {
+        try {
             CtClass ctClassVirtualZone = HookManager.getInstance().getClassPool()
                     .get("com.wurmonline.server.zones.VirtualZone");
             CtMethod ctMethodAddCreature = ctClassVirtualZone.getMethod("addCreature",
@@ -83,7 +197,7 @@ public class CamouflageMod implements WurmServerMod, Initable, ServerStartedList
                     "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", 3);
             find.addOpcode(Opcode.POP);
 
-            int lineNumber = byteArrayToLineNumber(find.get(), ctMethodAddCreature, 15);
+            //int lineNumber = byteArrayToLineNumber(find.get(), ctMethodAddCreature, 15);
 
             Bytecode replace = new Bytecode(ctClassVirtualZone.getClassFile().getConstPool());
             replace.addAload(0);
@@ -105,78 +219,58 @@ public class CamouflageMod implements WurmServerMod, Initable, ServerStartedList
             CodeReplacer codeReplacer = new CodeReplacer(ctMethodAddCreature.getMethodInfo().getCodeAttribute());
             codeReplacer.replaceCode(find.get(), replace.get());
             ctMethodAddCreature.getMethodInfo().rebuildStackMapIf6(ctClassVirtualZone.getClassPool(), ctClassVirtualZone.getClassFile());
-            ctClassVirtualZone.debugWriteFile("C:\\Users\\Jason\\Documents\\WU\\WU-Server\\byte code prints\\");
 
-        }catch (NotFoundException | BadBytecode | RuntimeException e){
-            logger.warning(e.getMessage() + " FAILURE  installing hook on put() in VirtualZone.addCreature().");
+            ctClassVirtualZone.getMethod("checkForEnemies", Descriptor.ofMethod(CtPrimitiveType.voidType,
+                    null)).insertBefore("" +
+                    "$0.creatures = com.joedobo27.c.CamouflageMod#trimCamouflagedPlayerFromView($0, $0.creatures);");
+
+            /////////// TESTING /////////////////
+            ctClassVirtualZone.debugWriteFile("C:\\Users\\Jason\\Documents\\WU\\WU-Server\\byte code prints\\");
+            /////////// TESTING /////////////////
+
+        }catch (NotFoundException | BadBytecode | RuntimeException | CannotCompileException e){
+            logger.warning(e.getMessage() + " FAILURE  modifying VirtualZone class methods.");
         }
         putHookInstalled = true;
     }
 
-    @Override
-    public void onServerStarted() {
-        if (putHookInstalled) {
-            CamouflageSpellActionPerformer camouflageSpellActionPerformer =
-                    CamouflageSpellActionPerformer.getCamouflageSpellActionPerformer();
-            ModActions.registerAction(camouflageSpellActionPerformer);
-            ModActions.registerAction(camouflageSpellActionPerformer.getActionEntry());
+    @Deprecated @SuppressWarnings({"unused", "WeakerAccess"})
+    public static Map<Long, CreatureMove> trimCamouflagedPlayerFromView(VirtualZone virtualZone,
+                                                                        Map<Long, CreatureMove> creatures) {
+        if (virtualZone == null || creatures == null)
+            return creatures;
+        return new HashMap<>(creatures.entrySet().stream()
+                .filter(entry -> {
+                    long creatureId = entry.getKey();
+                    return !canCreatureCamouflagedInVisionZone(virtualZone, creatureId);
+                })
+                .collect(toMap(Entry::getKey, Entry::getValue)));
 
-            CamouflageSpell.build();
-        }
+        //.collect(Collectors.toMap(Entry::getKey, Entry::getValue)));
+        // value is frequently null so it won't work.
     }
 
-
-    @SuppressWarnings("unused")
-    public static boolean canCreatureCamouflagedInVisionZone(VirtualZone visionZone, long creatureId){
-        Creature creature = Server.getInstance().getCreatureOrNull(creatureId);
-        Creature watcher = visionZone.getWatcher();
-        if (watcher == null || watcher instanceof Player || watcher.isGuard() || creature == null
-                || creature.getTarget() != null || !(creature instanceof Player))
-           return false;
-
-        ArrayList<Byte> armorPositions = new ArrayList<>(Arrays.asList(
-                BodyPartConstants.HEAD, BodyPartConstants.LEFT_ARM, BodyPartConstants.LEFT_HAND,
-                BodyPartConstants.RIGHT_ARM, BodyPartConstants.RIGHT_HAND, BodyPartConstants.TORSO,
-                BodyPartConstants.LEGS, BodyPartConstants.LEFT_FOOT, BodyPartConstants.RIGHT_FOOT));
-        double camouflagePowerTally = armorPositions.stream()
-                .mapToDouble(armorPos -> {
-                    try{
-                        return creature.getArmour(armorPos).getBonusForSpellEffect((byte)72);
-                    }catch (NoArmourException | NoSpaceException e) {
-                        return 0.0D;
+    /**
+     * https://stackoverflow.com/a/32648397/2298316
+     */
+    @Deprecated private static <T, K, U>
+    Collector<T, ?, Map<K, U>> toMap(Function<? super T, ? extends K> keyMapper,
+                                     Function<? super T, ? extends U> valueMapper) {
+        return Collectors.collectingAndThen(
+                Collectors.toList(),
+                list -> {
+                    Map<K, U> result = new HashMap<>();
+                    for (T item : list) {
+                        K key = keyMapper.apply(item);
+                        if (result.putIfAbsent(key, valueMapper.apply(item)) != null) {
+                            throw new IllegalStateException(String.format("Duplicate key %s", key));
+                        }
                     }
-                })
-                .average()
-                .orElse(0.0D);
-        if (camouflagePowerTally == 0.0D)
-            return false;
-
-        boolean isCamouflageOnCoolDown = creature.hasBeenAttackedWithin((int)Math.ceil(
-                ConfigureOptions.getInstance().getCamouflageRecoveryScale().doFunctionOfX(camouflagePowerTally)));
-
-        boolean spellPowerCamouflageFailure = Server.rand.nextInt(100) + 1 > Math.min(100, Math.max(1,
-                        ConfigureOptions.getInstance().getSpellPowerExplainsCamouflageChance()
-                                .doFunctionOfX(camouflagePowerTally)));
-
-        double armorLevel = armorPositions.stream()
-                .mapToDouble(armorPos -> {
-                    try{
-                        return ArmourTypes.getArmourBaseDR(creature.getArmour(armorPos).getArmourType());
-                    }catch (NoArmourException | NoSpaceException e) {
-                        return 0.0D;
-                    }
-                })
-                .average()
-                .orElse(0.0D);
-        boolean armorDRCamouflageFailure = Server.rand.nextInt(100) >= 100 - Math.min(100, Math.max(0,
-                ConfigureOptions.getInstance().getArmorDRExplainsCamouflageChance().doFunctionOfX(armorLevel)));
-
-
-        return (!isCamouflageOnCoolDown && !spellPowerCamouflageFailure && !armorDRCamouflageFailure);
+                    return result;
+                });
     }
 
-
-    @SuppressWarnings("SameParameterValue")
+    @Deprecated @SuppressWarnings("SameParameterValue")
     private int byteArrayToLineNumber(byte[] bytesSeek, CtMethod ctMethod, int byteArraySize)
             throws BadBytecode, RuntimeException {
 
@@ -209,7 +303,7 @@ public class CamouflageMod implements WurmServerMod, Initable, ServerStartedList
         return lineNumberAttribute.lineNumber(lineNumberTableOrdinal);
     }
 
-
+    @Deprecated
     private static long byteArrayToLong(byte[] bytesOriginal) {
         if (bytesOriginal.length < 8) {
             byte[] bytesLongPadded = new byte[8];
@@ -221,6 +315,7 @@ public class CamouflageMod implements WurmServerMod, Initable, ServerStartedList
             return ByteBuffer.wrap(bytesOriginal).getLong();
     }
 
+    @Deprecated
     private static void codeBranching(Bytecode bytecode, int opcode, int branchCount){
         bytecode.addOpcode(opcode);
         bytecode.add((branchCount >>> 8) & 0xFF, branchCount & 0xFF);
