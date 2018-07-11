@@ -11,21 +11,16 @@ import com.wurmonline.shared.constants.BodyPartConstants;
 import javassist.*;
 import javassist.bytecode.*;
 import org.gotti.wurmunlimited.modloader.ReflectionUtil;
-import org.gotti.wurmunlimited.modloader.classhooks.CodeReplacer;
 import org.gotti.wurmunlimited.modloader.classhooks.HookManager;
 import org.gotti.wurmunlimited.modloader.interfaces.*;
 import org.gotti.wurmunlimited.modsupport.actions.ModActions;
 
-import java.nio.ByteBuffer;
 import java.util.*;
-import java.util.Map.Entry;
-import java.util.function.Function;
 import java.util.logging.Logger;
-import java.util.stream.Collector;
-import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
-public class CamouflageMod implements WurmServerMod, Initable, ServerStartedListener, Configurable, PlayerMessageListener {
+public class CamouflageMod implements WurmServerMod, Initable, ServerStartedListener, Configurable,
+        PlayerMessageListener {
 
     static final Logger logger = Logger.getLogger(CamouflageMod.class.getName());
 
@@ -58,19 +53,9 @@ public class CamouflageMod implements WurmServerMod, Initable, ServerStartedList
     @Override
     public void init() {
         try {
-            HookManager.getInstance().getClassPool().get("com.wurmonline.server.zones.VirtualZone")
-                    .getDeclaredMethod("checkIfAttack").insertBefore("" +
-                    "if (com.joedobo27.c.CamouflageMod#shouldCamouflageCancelAttack($0, $2))" +
-                    "   return;");
-
-            HookManager.getInstance().getClassPool().get("com.wurmonline.server.creatures.Creature")
-                    .getMethod("attackTarget", Descriptor.ofMethod(CtPrimitiveType.voidType, null))
-                    .insertBefore("" +
-                            "if (com.joedobo27.c.CamouflageMod#shouldCamouflageCancelAttack($0))" +
-                            "   return;");
-
-            // Creature.attackTarget()
-        }catch (NotFoundException | CannotCompileException e){
+            byteVirtualZone();
+            byteCreature();
+        }catch (NotFoundException | CannotCompileException | BadBytecode e){
             logger.warning(e.getMessage() + " FAILURE  modifying VirtualZone class methods.");
         }
         putHookInstalled = true;
@@ -88,41 +73,144 @@ public class CamouflageMod implements WurmServerMod, Initable, ServerStartedList
         }
     }
 
-    @SuppressWarnings({"unused", "WeakerAccess"})
-    public static boolean shouldCamouflageCancelAttack(Creature creature) {
-        VisionArea visionArea = creature.getVisionArea();
-        VirtualZone virtualZone;
-        if (creature.isOnSurface())
-            virtualZone = visionArea.getSurface();
-        else
-            virtualZone = visionArea.getUnderGround();
-        return shouldCamouflageCancelAttack(virtualZone, creature.getWurmId());
+    /**
+     * search for this.creatures.put in VirtualZone to find what adds creatures to vision area
+     * and add in a method call hook right after each to remove camouflaged players. Some of the
+     * calls to the put arn't for players in a creatures vision.
+     * @throws NotFoundException JA exceptions.
+     */
+    private static void byteVirtualZone() throws NotFoundException, BadBytecode, CannotCompileException {
+        ClassPool classPool = HookManager.getInstance().getClassPool();
+        CtClass virtualZone = classPool.get("com.wurmonline.server.zones.VirtualZone");
+        virtualZone.getClassFile().compact();
+
+        // Add a call to my custom method to handle maybe removing creatures from vision area.
+        CtMethod addCreature = virtualZone.getMethod("addCreature", Descriptor.ofMethod(
+                CtPrimitiveType.booleanType, new CtClass[]{ CtPrimitiveType.longType, CtPrimitiveType.booleanType,
+                        CtPrimitiveType.longType,
+                CtPrimitiveType.floatType, CtPrimitiveType.floatType, CtPrimitiveType.floatType
+        }));
+        Bytecode find = new Bytecode(virtualZone.getClassFile().getConstPool());
+        find.addAload(0);
+        find.addGetfield("com/wurmonline/server/zones/VirtualZone", "creatures", "Ljava/util/Map;");
+        find.addLload(1);
+        find.addInvokestatic("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;");
+        find.addConstZero(classPool.get("com/wurmonline/server/creatures/CreatureMove"));
+        find.addInvokeinterface("java/util/Map", "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", 3);
+        find.addOpcode(Opcode.POP);
+        int tableLine = byteArrayToLineNumber(find.get(), addCreature.getMethodInfo().getCodeAttribute(), 1);
+        addCreature.insertAt(tableLine, "com.joedobo27.c.CamouflageMod#removeFromVisionZone($0, $0.creatures, creature);");
+
+        // Add a call to my custom method to handle maybe removing creatures from vision area.
+        CtMethod addItem = HookManager.getInstance().getClassPool().get("com.wurmonline.server.zones.VirtualZone")
+                .getDeclaredMethod("addItem", new CtClass[]{
+                        HookManager.getInstance().getClassPool().get("com.wurmonline.server.items.Item"),
+                        HookManager.getInstance().getClassPool().get("com.wurmonline.server.zones.VolaTile"),
+                        CtPrimitiveType.longType, CtPrimitiveType.booleanType
+                });
+        find = new Bytecode(virtualZone.getClassFile().getConstPool());
+        find.addAload(0);
+        find.addGetfield("com/wurmonline/server/zones/VirtualZone", "creatures", "Ljava/util/Map;");
+        find.addLload(3);
+        find.addInvokestatic("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;");
+        find.addConstZero(classPool.get("com/wurmonline/server/creatures/CreatureMove"));
+        find.addInvokeinterface("java/util/Map", "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", 3);
+        find.addOpcode(Opcode.POP);
+        tableLine = byteArrayToLineNumber(find.get(), addItem.getMethodInfo().getCodeAttribute(), 1);
+        addItem.insertAt(tableLine, "com.joedobo27.c.CamouflageMod#removeFromVisionZone($0, $0.creatures, $3);");
+
+        // Add a call to my custom method to handle maybe removing creatures from vision area.
+        CtMethod addCreatureToMap = HookManager.getInstance().getClassPool().get(
+                "com.wurmonline.server.zones.VirtualZone").getDeclaredMethod("addCreatureToMap");
+        find = new Bytecode(virtualZone.getClassFile().getConstPool());
+        find.addAload(0);
+        find.addGetfield("com/wurmonline/server/zones/VirtualZone", "creatures", "Ljava/util/Map;");
+        find.addAload(1);
+        find.addInvokevirtual("com/wurmonline/server/creatures/Creature", "getWurmId", "()J");
+        find.addInvokestatic("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;");
+        find.addAload(2);
+        find.addInvokeinterface("java/util/Map", "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", 3);
+        find.addOpcode(Opcode.POP);
+        tableLine = byteArrayToLineNumber(find.get(), addCreatureToMap.getMethodInfo().getCodeAttribute(), 1);
+        addCreatureToMap.insertAt(tableLine,
+                "com.joedobo27.c.CamouflageMod#removeFromVisionZone($0, $0.creatures, $1);");
+    }
+
+    private static void byteCreature() throws NotFoundException, CannotCompileException {
+        ClassPool classPool = HookManager.getInstance().getClassPool();
+        CtClass creature = classPool.get("com.wurmonline.server.creatures.Creature");
+
+        CtMethod attackTarget = creature.getMethod("attackTarget", Descriptor.ofMethod(
+                CtPrimitiveType.voidType, null));
+        attackTarget.insertBefore("" +
+                "if (com.joedobo27.c.CamouflageMod#shouldCamouflageCancelAttack($0, $0.target))" +
+                "   return;");
+
+        CtMethod setTarget = creature.getMethod("setTarget", Descriptor.ofMethod(
+                CtPrimitiveType.voidType,  new CtClass[]{CtPrimitiveType.longType, CtPrimitiveType.booleanType}));
+        setTarget.insertBefore("" +
+                "if (com.joedobo27.c.CamouflageMod#shouldCamouflageCancelAttack($0, $1))" +
+                "   return;");
     }
 
     @SuppressWarnings({"unused", "WeakerAccess"})
-    public static boolean shouldCamouflageCancelAttack(VirtualZone visionZone, long creatureId) {
-        Creature mob = visionZone.getWatcher();
-        Creature player = Server.getInstance().getCreatureOrNull(creatureId);
-        if (!(player instanceof Player) || mob == null || !canCreatureCamouflagedInVisionZone(visionZone, creatureId))
+    public static boolean shouldCamouflageCancelAttack(Creature watcher, long targetId) {
+        VisionArea visionArea = watcher.getVisionArea();
+        if (watcher == null || visionArea == null)
+            return false;
+        VirtualZone virtualZone;
+        if (watcher.isOnSurface())
+            virtualZone = visionArea.getSurface();
+        else
+            virtualZone = visionArea.getUnderGround();
+
+        if (!canCreatureCamouflagedInVisionZone(virtualZone, targetId))
+            return false;
+        watcher.removeTarget(targetId);
+
+        Creature player = Server.getInstance().getCreatureOrNull(targetId);
+        if (!(player instanceof Player))
             return false;
         HashMap<Long, CreatureMove> creatures;
         try {
-            creatures = ReflectionUtil.getPrivateField(visionZone, ReflectionUtil.getField(
+            creatures = ReflectionUtil.getPrivateField(virtualZone, ReflectionUtil.getField(
                     Class.forName("com.wurmonline.server.zones.VirtualZone"), "creatures"));
         }catch (ClassNotFoundException | NoSuchFieldException | IllegalAccessException e) {
             return false;
         }
-        boolean isTargeting = mob.getTarget() != null && mob.getTarget().getWurmId() == creatureId;
-
-        synchronized (visionZone) {
-            creatures.remove(creatureId);
-            if (isTargeting)
-                mob.removeTarget(creatureId);
-        }
+        boolean isTargeting = watcher.getTarget() != null && watcher.getTarget().getWurmId() == targetId;
+        creatures.remove(targetId);
+        if (isTargeting)
+            watcher.removeTarget(targetId);
+        if (Objects.equals(watcher.opponent, Creatures.getInstance().getCreatureOrNull(targetId)))
+            watcher.setOpponent(null);
         return true;
     }
 
-    @SuppressWarnings({"unused", "BooleanMethodIsAlwaysInverted"})
+    @SuppressWarnings({"unused", "WeakerAccess"})
+    public static void removeFromVisionZone(VirtualZone virtualZone, Map<Long, Creature> creatureMap,
+                                                         long creatureId) {
+        removeFromVisionZone(virtualZone, creatureMap, Server.getInstance().getCreatureOrNull(creatureId));
+    }
+
+    @SuppressWarnings({"unused", "WeakerAccess"})
+    public synchronized static void removeFromVisionZone(VirtualZone virtualZone, Map<Long, Creature> creatureMap,
+                                                         Creature creature) {
+        if (creatureMap.containsKey(creature.getWurmId()) && canCreatureCamouflagedInVisionZone(virtualZone,
+                creature.getWurmId())){
+            creatureMap.remove(creature.getWurmId());
+            Creature watcher = virtualZone.getWatcher();
+            boolean isTargeting = watcher.getTarget() != null && watcher.getTarget().getWurmId() == creature.getWurmId();
+            if (isTargeting)
+                watcher.removeTarget(creature.getWurmId());
+            if (Objects.equals(watcher.opponent, creature))
+                watcher.setOpponent(null);
+        }
+    }
+
     private static boolean canCreatureCamouflagedInVisionZone(VirtualZone visionZone, long creatureId){
         Creature creature = Server.getInstance().getCreatureOrNull(creatureId);
         Creature watcher = visionZone.getWatcher();
@@ -168,157 +256,36 @@ public class CamouflageMod implements WurmServerMod, Initable, ServerStartedList
         double armorScaled = ConfigureOptions.getInstance().getArmorDRExplainsCamouflageChance().doFunctionOfX(armorLevel);
         boolean armorDRCamouflageFailure = rollArmor >= 100 - Math.min(100, Math.max(0, armorScaled));
 
-
         return (!isCamouflageOnCoolDown && !spellPowerCamouflageFailure && !armorDRCamouflageFailure);
     }
 
-    @Deprecated
-    private static void oldCodeAttempts() {
-        try {
-            CtClass ctClassVirtualZone = HookManager.getInstance().getClassPool()
-                    .get("com.wurmonline.server.zones.VirtualZone");
-            CtMethod ctMethodAddCreature = ctClassVirtualZone.getMethod("addCreature",
-                    Descriptor.ofMethod(CtPrimitiveType.booleanType, new CtClass[]{CtPrimitiveType.longType,
-                            CtPrimitiveType.booleanType, CtPrimitiveType.longType, CtPrimitiveType.floatType,
-                            CtPrimitiveType.floatType, CtPrimitiveType.floatType}));
-
-
-            // Construct a byte array to find in addCreature's bytecode and get the table line number where that found
-            // byte array is at.
-            ctClassVirtualZone.getClassFile().compact();
-            Bytecode find = new Bytecode(ctClassVirtualZone.getClassFile().getConstPool());
-            find.addAload(0);
-            find.addGetfield("com.wurmonline.server.zones.VirtualZone", "creatures", "Ljava/util/Map;");
-            find.addLload(1);
-            find.addInvokestatic("java.lang.Long", "valueOf", "(J)Ljava/lang/Long;");
-            find.addConstZero(HookManager.getInstance().getClassPool().get(
-                    "com.wurmonline.server.creatures.CreatureMove"));
-            find.addInvokeinterface("java.util.Map", "put",
-                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", 3);
-            find.addOpcode(Opcode.POP);
-
-            //int lineNumber = byteArrayToLineNumber(find.get(), ctMethodAddCreature, 15);
-
-            Bytecode replace = new Bytecode(ctClassVirtualZone.getClassFile().getConstPool());
-            replace.addAload(0);
-            replace.addLload(1);
-            replace.addInvokestatic("com.joedobo27.c.CamouflageMod", "canCreatureCamouflagedInVisionZone",
-                    "(Lcom/wurmonline/server/zones/VirtualZone;J)Z");
-            codeBranching(replace, Opcode.IFNE, 18);
-            replace.addAload(0);
-            replace.addGetfield("com.wurmonline.server.zones.VirtualZone", "creatures", "Ljava/util/Map;");
-            replace.addLload(1);
-            replace.addInvokestatic("java.lang.Long", "valueOf", "(J)Ljava/lang/Long;");
-            replace.addConstZero(HookManager.getInstance().getClassPool().get(
-                    "com.wurmonline.server.creatures.CreatureMove"));
-            replace.addInvokeinterface("java.util.Map", "put",
-                    "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", 3);
-            replace.addOpcode(Opcode.POP);
-
-
-            CodeReplacer codeReplacer = new CodeReplacer(ctMethodAddCreature.getMethodInfo().getCodeAttribute());
-            codeReplacer.replaceCode(find.get(), replace.get());
-            ctMethodAddCreature.getMethodInfo().rebuildStackMapIf6(ctClassVirtualZone.getClassPool(), ctClassVirtualZone.getClassFile());
-
-            ctClassVirtualZone.getMethod("checkForEnemies", Descriptor.ofMethod(CtPrimitiveType.voidType,
-                    null)).insertBefore("" +
-                    "$0.creatures = com.joedobo27.c.CamouflageMod#trimCamouflagedPlayerFromView($0, $0.creatures);");
-
-            /////////// TESTING /////////////////
-            ctClassVirtualZone.debugWriteFile("C:\\Users\\Jason\\Documents\\WU\\WU-Server\\byte code prints\\");
-            /////////// TESTING /////////////////
-
-        }catch (NotFoundException | BadBytecode | RuntimeException | CannotCompileException e){
-            logger.warning(e.getMessage() + " FAILURE  modifying VirtualZone class methods.");
-        }
-        putHookInstalled = true;
-    }
-
-    @Deprecated @SuppressWarnings({"unused", "WeakerAccess"})
-    public static Map<Long, CreatureMove> trimCamouflagedPlayerFromView(VirtualZone virtualZone,
-                                                                        Map<Long, CreatureMove> creatures) {
-        if (virtualZone == null || creatures == null)
-            return creatures;
-        return new HashMap<>(creatures.entrySet().stream()
-                .filter(entry -> {
-                    long creatureId = entry.getKey();
-                    return !canCreatureCamouflagedInVisionZone(virtualZone, creatureId);
-                })
-                .collect(toMap(Entry::getKey, Entry::getValue)));
-
-        //.collect(Collectors.toMap(Entry::getKey, Entry::getValue)));
-        // value is frequently null so it won't work.
-    }
-
-    /**
-     * https://stackoverflow.com/a/32648397/2298316
-     */
-    @Deprecated private static <T, K, U>
-    Collector<T, ?, Map<K, U>> toMap(Function<? super T, ? extends K> keyMapper,
-                                     Function<? super T, ? extends U> valueMapper) {
-        return Collectors.collectingAndThen(
-                Collectors.toList(),
-                list -> {
-                    Map<K, U> result = new HashMap<>();
-                    for (T item : list) {
-                        K key = keyMapper.apply(item);
-                        if (result.putIfAbsent(key, valueMapper.apply(item)) != null) {
-                            throw new IllegalStateException(String.format("Duplicate key %s", key));
-                        }
-                    }
-                    return result;
-                });
-    }
-
-    @Deprecated @SuppressWarnings("SameParameterValue")
-    private int byteArrayToLineNumber(byte[] bytesSeek, CtMethod ctMethod, int byteArraySize)
+    @SuppressWarnings("SameParameterValue")
+    private static int byteArrayToLineNumber(byte[] bytesSeek, CodeAttribute codeAttribute, int offset)
             throws BadBytecode, RuntimeException {
 
         // Using bytesSeek iterate through the ctMethod's bytecode looking for a matching byte array sized to byteArraySize
         int bytecodeIndex = -1;
-        CodeIterator codeIterator = ctMethod.getMethodInfo().getCodeAttribute().iterator();
+        CodeIterator codeIterator = codeAttribute.iterator();
         codeIterator.begin();
-        long find = byteArrayToLong(bytesSeek);
-        while (codeIterator.hasNext() && codeIterator.lookAhead() + byteArraySize < codeIterator.getCodeLength()) {
+        while (codeIterator.hasNext() && codeIterator.lookAhead() + bytesSeek.length < codeIterator.getCodeLength()) {
             int index = codeIterator.next();
-            byte[] bytesFound = new byte[byteArraySize];
-            for(int i=0;i<byteArraySize;i++){
+            byte[] bytesFound = new byte[bytesSeek.length];
+            for(int i=0;i<bytesSeek.length;i++){
                 bytesFound[i] = (byte)codeIterator.byteAt(index + i);
             }
-            long found = byteArrayToLong(bytesFound);
-            if (found == find) {
+            if (Arrays.equals(bytesSeek, bytesFound)) {
                 bytecodeIndex = index;
             }
         }
         if (bytecodeIndex == -1)
             throw new RuntimeException("no bytecode match found.");
         // Get the line number table entry for the bytecodeIndex.
-        LineNumberAttribute lineNumberAttribute = (LineNumberAttribute) ctMethod.getMethodInfo().getCodeAttribute()
-                .getAttribute(LineNumberAttribute.tag);
+        LineNumberAttribute lineNumberAttribute = (LineNumberAttribute) codeAttribute.getAttribute(LineNumberAttribute.tag);
         int lineNumber = lineNumberAttribute.toLineNumber(bytecodeIndex);
         int lineNumberTableOrdinal =  IntStream.range(0, lineNumberAttribute.tableLength())
                 .filter(value -> Objects.equals(lineNumberAttribute.lineNumber(value), lineNumber))
                 .findFirst()
-                .orElseThrow(RuntimeException::new);
+                .orElseThrow(RuntimeException::new) + offset;
         return lineNumberAttribute.lineNumber(lineNumberTableOrdinal);
     }
-
-    @Deprecated
-    private static long byteArrayToLong(byte[] bytesOriginal) {
-        if (bytesOriginal.length < 8) {
-            byte[] bytesLongPadded = new byte[8];
-            System.arraycopy(bytesOriginal, 0, bytesLongPadded, 8 - bytesOriginal.length,
-                    bytesOriginal.length);
-            return ByteBuffer.wrap(bytesLongPadded).getLong();
-        }
-        else
-            return ByteBuffer.wrap(bytesOriginal).getLong();
-    }
-
-    @Deprecated
-    private static void codeBranching(Bytecode bytecode, int opcode, int branchCount){
-        bytecode.addOpcode(opcode);
-        bytecode.add((branchCount >>> 8) & 0xFF, branchCount & 0xFF);
-    }
-
 }
